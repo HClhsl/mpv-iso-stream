@@ -24,6 +24,8 @@ if not exist "%TARGET%" (
 
 copy /y "%~dp0iso_stream_proxy.py" "%TARGET%\" >nul
 if errorlevel 1 goto :err
+copy /y "%~dp0play-iso.bat" "%TARGET%\" >nul
+if errorlevel 1 goto :err
 
 if not exist "%TARGET%\portable_config\scripts" mkdir "%TARGET%\portable_config\scripts"
 copy /y "%~dp0portable_config\scripts\iso_bd_play.lua" "%TARGET%\portable_config\scripts\" >nul

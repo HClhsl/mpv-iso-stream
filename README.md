@@ -50,6 +50,7 @@
 
 1. 下载/克隆本仓库。
 2. 双击 `install.bat`，输入包含 `mpv.exe` 的目录（例如 `D:\mpv-lazy-full`）。
+   它会把代理、两个 Lua 脚本和 `play-iso.bat` 一起复制过去。
 3. 重启 mpv。
 
 ### 方式二：手动复制
@@ -59,6 +60,7 @@
 ├── mpv.exe
 ├── python.exe                  ← MPV_lazy 自带；独立 mpv 可省略（用 PATH 中的 python）
 ├── iso_stream_proxy.py         ← 复制到这里
+├── play-iso.bat                ← 可选，双击启动器
 └── portable_config/
     └── scripts/
         ├── iso_bd_play.lua     ← 复制到这里
@@ -97,7 +99,8 @@ python iso_stream_proxy.py --selftest                        :: 离线自检
 | `--playlist 序号\|编号` | 指定播放列表（`--list` 可查看） |
 | `--index N` | 回退模式下选择第 N 个大文件 |
 | `--log-file PATH` | 实时写日志（排查问题必备） |
-| `--mpv` | 就绪后自动启动同目录的 `mpv.exe` |
+| `--mpv` | 就绪后自动启动 mpv（按脚本目录 → 当前目录 → PATH 查找） |
+| `--mpv-exe PATH` | 显式指定 mpv 可执行文件路径（配合 `--mpv`） |
 | `--selftest` | 运行内置自检，无需网络 |
 
 代理端点：

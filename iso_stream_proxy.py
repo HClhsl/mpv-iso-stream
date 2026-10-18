@@ -34,6 +34,7 @@ import bisect
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -1506,6 +1507,22 @@ def setup_streams(args, remote):
     return True
 
 
+def find_mpv(explicit=None):
+    """按 显式路径 → 脚本目录 → 当前目录 → PATH 的顺序查找 mpv。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [explicit,
+             os.path.join(here, "mpv.exe"),
+             os.path.join(here, "mpv"),
+             os.path.join(os.getcwd(), "mpv.exe"),
+             os.path.join(os.getcwd(), "mpv"),
+             shutil.which("mpv"),
+             shutil.which("mpv.exe")]
+    for p in cands:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description="在线播放 Alist/115 上的 Blu-ray ISO")
     ap.add_argument("url", nargs="?", default=None,
@@ -1517,6 +1534,8 @@ def main():
     ap.add_argument("--index", type=int, default=-1,
                     help="（裸扫描回退模式）选择第几个大文件，默认体积最大者")
     ap.add_argument("--mpv", action="store_true", help="服务器就绪后自动调用 mpv.exe 播放")
+    ap.add_argument("--mpv-exe", default=None,
+                    help="mpv 可执行文件路径（配合 --mpv；默认自动查找）")
     ap.add_argument("--log-file", default=None,
                     help="把日志实时同步写入文件（默认不写，排查问题时指定）")
     ap.add_argument("--selftest", action="store_true", help="运行内置自检（无需网络）")
@@ -1559,11 +1578,11 @@ def main():
     log("注意：sign 过期后请求会 401，届时重新复制 Alist 最新链接并重启本脚本。")
 
     if args.mpv:
-        mpv_exe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mpv.exe")
-        if os.path.exists(mpv_exe):
+        mpv_exe = find_mpv(args.mpv_exe)
+        if mpv_exe:
             subprocess.Popen([mpv_exe, url], cwd=os.path.dirname(mpv_exe))
         else:
-            log("未找到 mpv.exe，跳过自动播放")
+            log("未找到 mpv.exe（可用 --mpv-exe 指定路径），跳过自动播放")
 
     try:
         while True:
