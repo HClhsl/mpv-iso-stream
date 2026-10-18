@@ -125,31 +125,76 @@ local function episode_items(p)
     return out
 end
 
-local function show_titles(cat)
+-- 按内容签名去重（同内容不同音轨/版本只留一个），供手动选单使用
+local function candidate_playlists(cat, min_dur)
+    local out, seen = {}, {}
+    for _, p in ipairs(cat and cat.playlists or {}) do
+        if not p.looped and (p.duration or 0) >= min_dur then
+            local parts = {}
+            for _, it in ipairs(p.items or {}) do
+                parts[#parts + 1] = string.format("%s:%.0f",
+                    tostring(it.clip), it.duration or 0)
+            end
+            local sig = table.concat(parts, ",")
+            if not seen[sig] then
+                seen[sig] = true
+                out[#out + 1] = p
+            end
+        end
+    end
+    return out
+end
+
+-- manual=true：Ctrl+L 手动打开，列出所有非循环播放列表
+local function show_titles(cat, manual)
     local p = find_playlist(cat)
     if not p then return false end
     local eps = episode_items(p)
-    if #eps < 2 then return false end
+    local by_item = #eps >= 2
+    local cands = nil
+    if not by_item then
+        if not manual then return false end
+        cands = candidate_playlists(cat, 60)
+        if #cands < 2 then return false end
+    end
+
     if not HAS_UOSC then
-        mp.commandv("loadfile",
-            session_url("/bd/" .. p.name .. "/" .. eps[1].index .. ".m2ts"), "replace")
-        mp.osd_message("未检测到 uosc，已播放第 1 段", 3)
+        if by_item then
+            mp.commandv("loadfile",
+                session_url("/bd/" .. p.name .. "/" .. eps[1].index .. ".m2ts"), "replace")
+            mp.osd_message("未检测到 uosc，已播放第 1 段", 3)
+        else
+            mp.osd_message("剧集菜单需要 uosc", 2)
+        end
         return true
     end
+
     local items = {}
-    for _, it in ipairs(eps) do
-        local d = math.floor(it.duration)
-        items[#items + 1] = {
-            title = string.format("第 %d 段  %02d:%02d", it.index + 1,
-                                  math.floor(d / 60), d % 60),
-            value = "item:" .. it.index,
-            keep_open = false,
-        }
+    if by_item then
+        for _, it in ipairs(eps) do
+            local d = math.floor(it.duration)
+            items[#items + 1] = {
+                title = string.format("第 %d 段  %02d:%02d", it.index + 1,
+                                      math.floor(d / 60), d % 60),
+                value = "item:" .. it.index,
+                keep_open = false,
+            }
+        end
+        items[#items + 1] = { title = "连续播放全部", value = "all" }
+    else
+        for _, cp in ipairs(cands) do
+            local d = math.floor(cp.duration)
+            items[#items + 1] = {
+                title = string.format("%s  %02d:%02d:%02d", cp.name,
+                    math.floor(d / 3600), math.floor(d / 60) % 60, d % 60),
+                value = "pl:" .. cp.name,
+                keep_open = false,
+            }
+        end
     end
-    items[#items + 1] = { title = "连续播放全部", value = "all" }
     mp.commandv("script-message-to", "uosc", "open-menu", utils.format_json({
         type = "iso-titles",
-        title = "选择剧集/分段 — " .. p.name,
+        title = "选择剧集/播放列表" .. (by_item and (" — " .. p.name) or ""),
         items = items,
         callback = { SCRIPT_NAME, "iso-title-event" },
     }))
@@ -158,6 +203,11 @@ local function show_titles(cat)
 end
 
 local function play_chosen(value)
+    local plname = (value or ""):match("^pl:(.+)$")
+    if plname then
+        mp.commandv("loadfile", session_url("/bd/" .. plname .. ".m2ts"), "replace")
+        return
+    end
     local p = find_playlist(state.catalog)
     if not p then return end
     if value == "all" then
@@ -301,8 +351,8 @@ local function open_titles()
         mp.osd_message("剧集菜单需要 uosc", 2)
         return
     end
-    if not show_titles(state.catalog) then
-        mp.osd_message("当前播放列表只有一段", 2)
+    if not show_titles(state.catalog, true) then
+        mp.osd_message("没有可选择的剧集/播放列表", 2)
     end
 end
 
