@@ -1106,21 +1106,12 @@ class VStream:
             pos = seg_end
 
 
-def build_vstream(pl_name, pl, clips):
-    """把播放列表的各 PlayItem 经 EP map 裁剪后拼接为虚拟流。
-
-    裁剪依赖 CLPI 的 EP map；无 EP map 时整段 clip 原样保留——大多数原盘
-    IN/OUT 即 clip 首尾，此时无副作用；分支盘会有少量冗余帧。
-    """
-    # 高延迟网盘：先并行预取全部 clip 的 extent/CLPI（IO 是瓶颈）
-    uniq = list(dict.fromkeys(c for c, _, _, _ in pl["items"]))
-    if len(uniq) > 1:
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            list(ex.map(lambda c: (clips.extents(c), clips.clpi(c)), uniq))
-
+def _build_pieces(pl, clips, indices):
+    """按 indices 顺序裁剪各 PlayItem 并拼成虚拟流的物理分段。"""
     pieces = []
     cursor = 0
-    for clip_id, in45, out45, stc_id in pl["items"]:
+    for idx in indices:
+        clip_id, in45, out45, stc_id = pl["items"][idx]
         ext = clips.extents(clip_id)
         if not ext:
             continue
@@ -1152,9 +1143,31 @@ def build_vstream(pl_name, pl, clips):
             off += elen
             if off >= byte1:
                 break
+    return pieces, cursor
 
-    meta = build_meta(pl_name, pl, pieces, cursor)
-    return VStream(pl_name, pieces, cursor, meta)
+
+def build_vstream(pl_name, pl, clips, only_item=None):
+    """把播放列表的各 PlayItem 经 EP map 裁剪后拼接为虚拟流。
+
+    only_item 指定时只构建该下标的单个 PlayItem（多集盘的“按集播放”）——
+    多集盘各集之间时间戳不连续，独立成流交给 mpv 逐集播放更稳妥。
+    裁剪依赖 CLPI 的 EP map；无 EP map 时整段 clip 原样保留。
+    """
+    indices = [only_item] if only_item is not None else list(range(len(pl["items"])))
+    # 高延迟网盘：先并行预取全部 clip 的 extent/CLPI（IO 是瓶颈）
+    uniq = list(dict.fromkeys(pl["items"][i][0] for i in indices))
+    if len(uniq) > 1:
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(lambda c: (clips.extents(c), clips.clpi(c)), uniq))
+
+    pieces, total = _build_pieces(pl, clips, indices)
+    if only_item is None:
+        meta = build_meta(pl_name, pl, pieces, total)
+        name = pl_name
+    else:
+        meta = build_item_meta(pl_name, pl, pieces, total, only_item)
+        name = "%s#%d" % (pl_name, only_item)
+    return VStream(name, pieces, total, meta)
 
 
 def build_meta(pl_name, pl, pieces, total):
@@ -1187,6 +1200,33 @@ def build_meta(pl_name, pl, pieces, total):
     }
 
 
+def build_item_meta(pl_name, pl, pieces, total, idx):
+    """单个 PlayItem 的章节元数据（多集盘按集播放时使用）。"""
+    clip_id, in45, out45, _ = pl["items"][idx]
+    duration = max(0, out45 - in45) / TS45
+    secs = []
+    for mtype, ref, ts in pl["marks"]:
+        if mtype != 1 or ref != idx:
+            continue
+        sec = (ts - in45) / TS45
+        if sec < 1.0 or sec > duration:
+            continue
+        if any(abs(sec - s) < 0.5 for s in secs):
+            continue
+        secs.append(sec)
+    chapters = [{"t": round(t, 3), "title": "第 %d 章" % (i + 1)}
+                for i, t in enumerate(secs)]
+    return {
+        "name": "%s 第 %d 段" % (pl_name, idx + 1),
+        "duration": round(duration, 3),
+        "items": 1,
+        "clips": [clip_id],
+        "chapters": chapters,
+        "size": total,
+        "pieces": len(pieces),
+    }
+
+
 # ==================== HTTP 服务 ====================
 
 class StreamProxy(BaseHTTPRequestHandler):
@@ -1195,6 +1235,9 @@ class StreamProxy(BaseHTTPRequestHandler):
     build_lock = threading.Lock()
     main = None      # 主播放列表名
     catalog = None   # [(name, duration_sec, chapters, items)] 全部播放列表
+    pls = None       # [(name, pl)] 全部播放列表（/catalog.json 用）
+    pl_map = None    # {name: pl}
+    clips = None     # ClipStore（按集构建流用）
     remote = None
     ready = False    # False = 仍在解析，所有请求返回 503
 
@@ -1214,6 +1257,44 @@ class StreamProxy(BaseHTTPRequestHandler):
             if vs is not None:
                 cls.streams[name] = vs
             return vs
+
+    @classmethod
+    def get_item_stream(cls, name, idx):
+        """播放列表中单个 PlayItem 的独立流（多集盘按集播放）。"""
+        pl = (cls.pl_map or {}).get(name)
+        if pl is None or idx < 0 or idx >= len(pl["items"]):
+            return None
+        key = "%s#%d" % (name, idx)
+        vs = cls.streams.get(key)
+        if vs is not None:
+            return vs
+        with cls.build_lock:
+            vs = cls.streams.get(key)
+            if vs is None:
+                vs = build_vstream(name, pl, cls.clips, only_item=idx)
+                cls.streams[key] = vs
+            return vs
+
+    @classmethod
+    def catalog_payload(cls):
+        out = []
+        for name, pl in (cls.pls or []):
+            items = []
+            for i, (clip, in45, out45, _stc) in enumerate(pl["items"]):
+                items.append({
+                    "index": i,
+                    "clip": clip,
+                    "duration": round(max(0, out45 - in45) / TS45, 3),
+                })
+            out.append({
+                "name": name,
+                "duration": round(pl["duration45"] / TS45, 3),
+                "chapters": sum(1 for m in pl["marks"] if m[0] == 1),
+                "looped": is_looped_playlist(pl),
+                "main": name == cls.main,
+                "items": items,
+            })
+        return {"main": cls.main, "playlists": out}
 
     def log_message(self, fmt, *args):
         log("[proxy] " + (fmt % args))
@@ -1253,8 +1334,24 @@ class StreamProxy(BaseHTTPRequestHandler):
                     % "".join(rows)).encode("utf-8")
             self._body(200, "text/html; charset=utf-8", body, head_only)
             return
+        if path == "/catalog.json":
+            body = json.dumps(StreamProxy.catalog_payload(),
+                              ensure_ascii=False).encode("utf-8")
+            self._body(200, "application/json; charset=utf-8", body, head_only)
+            return
         if path == "/favicon.ico":
             self.send_error(404)
+            return
+
+        # 单个 PlayItem 的独立流（多集盘按集播放）
+        m = re.match(r"^/bd/([^/]+)/(\d+)\.json$", path)
+        if m:
+            vs = self.get_item_stream(m.group(1), int(m.group(2)))
+            if vs is None:
+                self.send_error(404)
+                return
+            self._body(200, "application/json; charset=utf-8",
+                       json.dumps(vs.meta, ensure_ascii=False).encode("utf-8"), head_only)
             return
 
         m = re.match(r"^/bd/([^/]+)\.json$", path)
@@ -1275,13 +1372,14 @@ class StreamProxy(BaseHTTPRequestHandler):
                        json.dumps(vs.meta, ensure_ascii=False).encode("utf-8"), head_only)
             return
 
-        m = re.match(r"^/bd/([^/]+)\.m2ts$", path)
+        m = re.match(r"^/bd/([^/]+)/(\d+)\.m2ts$", path)
         if m:
-            vs = self.get_stream(m.group(1))
+            vs = self.get_item_stream(m.group(1), int(m.group(2)))
         elif path == "/movie.m2ts" and self.main:
             vs = self.get_stream(self.main)
         else:
-            vs = None
+            m = re.match(r"^/bd/([^/]+)\.m2ts$", path)
+            vs = self.get_stream(m.group(1)) if m else None
         if vs is None:
             self.send_error(404)
             return
@@ -1525,6 +1623,9 @@ def setup_streams(args, remote):
         for name, p in pls]
     StreamProxy.builder = lambda name: (
         build_vstream(name, pl_map[name], clips) if name in pl_map else None)
+    StreamProxy.pls = pls
+    StreamProxy.pl_map = pl_map
+    StreamProxy.clips = clips
     log_stats(remote, cf, t0, "就绪")
     return True
 
@@ -1998,7 +2099,12 @@ def run_selftest():
         assert vs.total == len(expected), (vs.total, len(expected))
         ch = vs.meta["chapters"]
         assert [c["t"] for c in ch] == ch_expected, ch
-        print("UDF 目录遍历 + 虚拟流拼装 ✔（%s布局，%.2f MiB，%d 分段，%d 章）"
+        # 多集盘：单个 PlayItem 独立成流
+        vs_item = build_vstream("00001", pl, clips, only_item=0)
+        assert vs_item.total == len(clip1[:2000 * PKT]), vs_item.total
+        assert vs_item.meta["items"] == 1
+        assert [c["t"] for c in vs_item.meta["chapters"]] == [11.0]
+        print("UDF 目录遍历 + 虚拟流拼装 ✔（%s布局，%.2f MiB，%d 分段，%d 章，按集流正常）"
               % ("元数据分区" if with_meta else "普通",
                  vs.total / 1024 ** 2, len(vs.pieces), len(ch)))
 
@@ -2009,6 +2115,9 @@ def run_selftest():
     StreamProxy.builder = None
     StreamProxy.ready = True
     StreamProxy.catalog = [("00001", pl["duration45"] / TS45, 2, 2)]
+    StreamProxy.pls = [("00001", pl)]
+    StreamProxy.pl_map = {"00001": pl}
+    StreamProxy.clips = clips
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), StreamProxy)
     port = httpd.server_address[1]
     th = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -2023,7 +2132,19 @@ def run_selftest():
         with urllib.request.urlopen(base + "/movie.json", timeout=10) as r:
             meta = json.loads(r.read())
         assert meta["chapters"][0]["t"] == 11.0
-        print("HTTP 服务 ✔（Range 跨段拼接与章节元数据均正确）")
+        # 目录与按集端点
+        with urllib.request.urlopen(base + "/catalog.json", timeout=10) as r:
+            cat = json.loads(r.read())
+        assert cat["main"] == "00001"
+        main_pl = [p for p in cat["playlists"] if p["name"] == "00001"][0]
+        assert len(main_pl["items"]) == 2, main_pl
+        with urllib.request.urlopen(base + "/bd/00001/0.m2ts", timeout=10) as r:
+            got = r.read()
+        assert got == clip1[:2000 * PKT], "按集流数据不一致"
+        with urllib.request.urlopen(base + "/bd/00001/0.json", timeout=10) as r:
+            item_meta = json.loads(r.read())
+        assert item_meta["items"] == 1 and item_meta["chapters"][0]["t"] == 11.0
+        print("HTTP 服务 ✔（Range 跨段拼接、章节元数据、按集流与目录 JSON 均正确）")
     finally:
         httpd.shutdown()
 

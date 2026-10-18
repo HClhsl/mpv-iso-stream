@@ -20,22 +20,26 @@ local meta_url = nil  -- 章节元数据地址（对应正在播放的列表）
 local fetching = false
 
 local function parse_proxy_url(path)
-    -- 支持 /bd/<编号>.m2ts 与 /movie.m2ts
-    local host, name = path:match("^http://127%.0%.0%.1:(%d+)/bd/([^/]+)%.m2ts$")
-    if not host then
-        host, name = path:match("^http://127%.0%.0%.1:(%d+)/movie%.m2ts$")
+    -- 去掉防断点续播用的查询参数
+    path = path:gsub("%?.*$", "")
+    -- 支持 /bd/<编号>/<集>.m2ts、/bd/<编号>.m2ts 与 /movie.m2ts
+    local host, name, idx = path:match(
+        "^http://127%.0%.0%.1:(%d+)/bd/([^/]+)/(%d+)%.m2ts$")
+    if host then
+        local base = "http://127.0.0.1:" .. host
+        return base, base .. "/bd/" .. name .. "/" .. idx .. ".json"
     end
-    if not host then
-        return nil
+    host, name = path:match("^http://127%.0%.0%.1:(%d+)/bd/([^/]+)%.m2ts$")
+    if host then
+        local base = "http://127.0.0.1:" .. host
+        return base, base .. "/bd/" .. name .. ".json"
     end
-    local base = "http://127.0.0.1:" .. host
-    local meta_url
-    if name then
-        meta_url = base .. "/bd/" .. name .. ".json"
-    else
-        meta_url = base .. "/movie.json"
+    host = path:match("^http://127%.0%.0%.1:(%d+)/movie%.m2ts$")
+    if host then
+        local base = "http://127.0.0.1:" .. host
+        return base, base .. "/movie.json"
     end
-    return base, meta_url
+    return nil
 end
 
 local function fetch_meta(url, cb)

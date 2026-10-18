@@ -3,6 +3,7 @@
 -- 用法：在 Alist/115 网页上复制 ISO 直链 → 在 mpv 中按 Ctrl+b
 --       （或 script-message iso-play [链接]）
 -- 脚本自动完成：选空闲端口 → 启动 iso_stream_proxy.py 解析 → 等待就绪 → 播放正片
+-- 多集盘会自动弹出剧集选择菜单；Ctrl+L 可随时再次打开。
 -- 配合 iso_bd_chapters.lua：播放后自动加载章节，Ctrl+M 打开章节菜单。
 -- 依赖：Python 3.8+（优先用 mpv 根目录的 python.exe）与 iso_stream_proxy.py；
 --       Windows 10+ 自带 curl，剪贴板读取使用 PowerShell。
@@ -13,9 +14,17 @@ local mp = require "mp"
 local utils = require "mp.utils"
 local msg = require "mp.msg"
 
+local SCRIPT_NAME = mp.get_script_name()
 local BIND_KEY = "Ctrl+b"
+local TITLE_KEY = "Ctrl+l"   -- 重新打开剧集/分段选择
 local POLL_INTERVAL = 1      -- 秒
 local POLL_TIMEOUT = 300     -- 解析超时（秒）
+-- 每次播放使用唯一 URL 参数：避免与 mpv 的 watch-later 断点续播撞车
+-- （代理地址固定为 /movie.m2ts，不加参数会沿用上一部片的进度）
+local SESSION = string.format("%d_%d", os.time(),
+                              math.floor((os.clock() * 1000) % 1000000))
+local HAS_UOSC = utils.file_info(utils.join_path(
+    mp.get_property("config-dir") or "", "scripts", "uosc", "main.lua")) ~= nil
 
 -- mpv-lazy 根目录 = portable_config 的上级；独立安装时退回脚本目录
 local cfg = mp.get_property("config-dir") or ""
@@ -45,7 +54,7 @@ end
 local LOG = utils.join_path(root ~= "" and root or script_dir, "iso-play-last.log")
 local PORTS = { 8080, 8081, 8082, 8083, 8084 }
 
-local state = { parsing = false, playing = false, port = nil, url = nil }
+local state = { parsing = false, playing = false, port = nil, url = nil, catalog = nil }
 
 local function osd(text, dur)
     mp.osd_message(text, dur or 2)
@@ -79,6 +88,97 @@ local function get_clipboard(cb)
     end)
 end
 
+local function curl_json(url, cb)
+    mp.command_native_async({
+        name = "subprocess",
+        args = { "curl", "-s", "--max-time", "8", url },
+        capture_stdout = true,
+        playback_only = false,
+    }, function(ok, res)
+        if not ok or not res or res.status ~= 0 or not res.stdout then
+            cb(nil)
+            return
+        end
+        cb(utils.parse_json(res.stdout))
+    end)
+end
+
+local function session_url(path)
+    return "http://127.0.0.1:" .. state.port .. path .. "?s=" .. SESSION
+end
+
+local function find_playlist(cat)
+    if not cat then return nil end
+    for _, p in ipairs(cat.playlists or {}) do
+        if p.name == cat.main then return p end
+    end
+    return nil
+end
+
+local function episode_items(p)
+    local out = {}
+    for _, it in ipairs(p and p.items or {}) do
+        if it.duration >= 600 then
+            out[#out + 1] = it
+        end
+    end
+    return out
+end
+
+local function show_titles(cat)
+    local p = find_playlist(cat)
+    if not p then return false end
+    local eps = episode_items(p)
+    if #eps < 2 then return false end
+    if not HAS_UOSC then
+        mp.commandv("loadfile",
+            session_url("/bd/" .. p.name .. "/" .. eps[1].index .. ".m2ts"), "replace")
+        mp.osd_message("未检测到 uosc，已播放第 1 段", 3)
+        return true
+    end
+    local items = {}
+    for _, it in ipairs(eps) do
+        local d = math.floor(it.duration)
+        items[#items + 1] = {
+            title = string.format("第 %d 段  %02d:%02d", it.index + 1,
+                                  math.floor(d / 60), d % 60),
+            value = "item:" .. it.index,
+            keep_open = false,
+        }
+    end
+    items[#items + 1] = { title = "连续播放全部", value = "all" }
+    mp.commandv("script-message-to", "uosc", "open-menu", utils.format_json({
+        type = "iso-titles",
+        title = "选择剧集/分段 — " .. p.name,
+        items = items,
+        callback = { SCRIPT_NAME, "iso-title-event" },
+    }))
+    mp.osd_message("请选择要播放的剧集（Ctrl+L 可再次打开）", 3)
+    return true
+end
+
+local function play_chosen(value)
+    local p = find_playlist(state.catalog)
+    if not p then return end
+    if value == "all" then
+        mp.commandv("loadfile", session_url("/movie.m2ts"), "replace")
+        return
+    end
+    local idx = tonumber((value or ""):match("^item:(%d+)$"))
+    if idx then
+        mp.commandv("loadfile",
+            session_url("/bd/" .. p.name .. "/" .. idx .. ".m2ts"), "replace")
+    end
+end
+
+mp.register_script_message("iso-title-event", function(json)
+    local ev = utils.parse_json(json)
+    if ev and ev.type == "activate" and ev.value ~= nil then
+        play_chosen(tostring(ev.value))
+        mp.commandv("script-message-to", "uosc", "close-menu", "iso-titles")
+    end
+end)
+
 local function find_free_port(i, cb)
     if i > #PORTS then
         cb(nil)
@@ -104,8 +204,13 @@ local function poll_ready(t0)
         if code == "200" then
             state.parsing = false
             state.playing = true
-            osd("解析完成，开始播放正片", 2)
-            mp.commandv("loadfile", base .. "/movie.m2ts", "replace")
+            osd("解析完成", 2)
+            curl_json(base .. "/catalog.json", function(cat)
+                state.catalog = cat
+                if not show_titles(cat) then
+                    mp.commandv("loadfile", session_url("/movie.m2ts"), "replace")
+                end
+            end)
         elseif code == "503" then
             -- 代理已启动、仍在解析 BDMV
             mp.osd_message(string.format("正在解析原盘导航数据… %d 秒", el), 1)
@@ -186,6 +291,23 @@ end
 mp.register_script_message("iso-play", function(url)
     start(url)
 end)
+
+local function open_titles()
+    if not state.port or not state.catalog then
+        osd("当前没有可用的剧集列表（先按 Ctrl+b 播放原盘）", 3)
+        return
+    end
+    if not HAS_UOSC then
+        mp.osd_message("剧集菜单需要 uosc", 2)
+        return
+    end
+    if not show_titles(state.catalog) then
+        mp.osd_message("当前播放列表只有一段", 2)
+    end
+end
+
+mp.register_script_message("iso-titles", open_titles)
+mp.add_key_binding(TITLE_KEY, "iso-titles-menu", open_titles, { repeatable = false })
 
 mp.add_key_binding(BIND_KEY, "iso-play-clipboard", function()
     start(nil)
