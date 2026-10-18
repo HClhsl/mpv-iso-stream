@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 SECTOR = 2048
 PKT = 192  # m2ts 源包大小：4 字节 TP_extra_header + 188 字节 TS 包
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) iso-stream-proxy/2.0"
-TS90 = 90000.0  # MPLS 时间戳单位（Hz）
+TS45 = 45000.0  # MPLS PlayItem IN/OUT 与 PlayMark 时间单位（45 kHz）
 
 TAG_AVDP = 2
 TAG_PARTITION = 5
@@ -63,6 +63,7 @@ TAG_EFE = 266
 
 MIN_VIDEO_SIZE = 50 * 1024 * 1024  # 裸扫描模式：只当作视频候选的最小文件大小
 EXTENT_SCAN_MIN = 100 * 1024 * 1024  # 裸扫描模式：分配描述符判定的最小分块
+MAX_403_REFRESH = 8  # CDN 403 时最多刷新直链的次数
 
 _LOG_FH = None
 _LOG_LOCK = threading.Lock()
@@ -174,7 +175,7 @@ class Remote:
                     # CDN 地址失效/风控：全局共享一次刷新（并发线程不重复刷）
                     with self._refresh_lock:
                         if self._gen == gen:
-                            if self.stat_retry403 >= 8:
+                            if self.stat_retry403 >= MAX_403_REFRESH:
                                 raise
                             self.stat_retry403 += 1
                             log("CDN 返回 %d，刷新直链（第 %d 次），稍候重试…"
@@ -780,10 +781,10 @@ def scan_extents(block, part_len_hint, info_len):
 # 时间戳：MPLS 的 IN/OUT/PlayMark 为 90kHz；EP map 的 PTS 为 45kHz。
 
 def parse_mpls(data):
-    """解析 .mpls，返回 {items, marks, duration90, sub_paths}。
+    """解析 .mpls，返回 {items, marks, duration45, sub_paths, playback_type}。
 
-    items: [(clip_id, in90, out90, stc_id)]
-    marks: [(mark_type, play_item_ref, ts90)]   # type 1 = 章节入口标记
+    items: [(clip_id, in45, out45, stc_id)]   # 45 kHz 时间戳
+    marks: [(mark_type, play_item_ref, ts45)]  # type 1 = 章节入口标记
     """
     if len(data) < 20 or data[0:4] != b"MPLS":
         raise UdParseError("不是 MPLS 文件")
@@ -811,9 +812,9 @@ def parse_mpls(data):
         # q+9..q+11：11 位保留 + 1 位 multi_angle + 4 位 connection_condition
         # q+11：stc_id；q+12：IN_time；q+16：OUT_time
         stc_id = data[q + 11]
-        in90 = be32(data, q + 12)
-        out90 = be32(data, q + 16)
-        items.append((clip_id, in90, out90, stc_id))
+        in45 = be32(data, q + 12)
+        out45 = be32(data, q + 16)
+        items.append((clip_id, in45, out45, stc_id))
         o = q + ilen
 
     marks = []
@@ -829,9 +830,12 @@ def parse_mpls(data):
             marks.append((mtype, ref, ts))
             o += 14
 
-    duration90 = sum(max(0, out - intr) for _, intr, out, _ in items)
-    return {"items": items, "marks": marks, "duration90": duration90,
-            "sub_paths": n_sub}
+    duration45 = sum(max(0, out - intr) for _, intr, out, _ in items)
+    # AppInfo 紧跟 40 字节头：长度@36、保留@40、playback_type@41
+    # （libbluray _parse_appinfo；0/1=Movie/Interactive，2/3 带 playback_count）
+    playback_type = data[41] if len(data) >= 42 else None
+    return {"items": items, "marks": marks, "duration45": duration45,
+            "sub_paths": n_sub, "playback_type": playback_type}
 
 
 def parse_clpi(data):
@@ -1116,15 +1120,15 @@ def build_vstream(pl_name, pl, clips):
 
     pieces = []
     cursor = 0
-    for clip_id, in90, out90, stc_id in pl["items"]:
+    for clip_id, in45, out45, stc_id in pl["items"]:
         ext = clips.extents(clip_id)
         if not ext:
             continue
         info = clips.clpi(clip_id)
         eps = filter_eps_by_stc(info["eps"], info.get("stc"), stc_id) if info else []
         if eps:
-            s_in = spn_before(eps, in90 // 2)
-            s_out = spn_after(eps, out90 // 2)
+            s_in = spn_before(eps, in45)
+            s_out = spn_after(eps, out45)
             n_pkts = info["num_packets"]
             spn_in = s_in if s_in is not None else 0
             spn_out = n_pkts if s_out is None else min(s_out, n_pkts)
@@ -1161,10 +1165,10 @@ def build_meta(pl_name, pl, pieces, total):
         if mtype != 1 or ref >= len(items):
             continue
         rel = sum(max(0, out - intr) for _, intr, out, _ in items[:ref])
-        _, in90, out90, _ = items[ref]
-        rel += ts - in90
-        rel = max(0, min(rel, pl["duration90"]))
-        sec = rel / TS90
+        _, in45, out45, _ = items[ref]
+        rel += ts - in45
+        rel = max(0, min(rel, pl["duration45"]))
+        sec = rel / TS45
         if sec < 1.0:
             continue
         if any(abs(sec - s) < 0.5 for s in secs):
@@ -1174,7 +1178,7 @@ def build_meta(pl_name, pl, pieces, total):
                 for i, t in enumerate(secs)]
     return {
         "name": pl_name,
-        "duration": round(pl["duration90"] / TS90, 3),
+        "duration": round(pl["duration45"] / TS45, 3),
         "items": len(items),
         "clips": [c for c, _, _, _ in items],
         "chapters": chapters,
@@ -1364,8 +1368,19 @@ def list_playlists(cf, pmap, part_start, part_len, tree, limit=2000):
             for r in ex.map(load, names):
                 if r:
                     pls.append(r)
-    pls.sort(key=lambda kv: kv[1]["duration90"], reverse=True)
+    pls.sort(key=lambda kv: kv[1]["duration45"], reverse=True)
     return pls
+
+
+def is_looped_playlist(pl):
+    """菜单/循环类播放列表：相同 PlayItem（clip+IN/OUT）被反复重复。
+
+    蓝光原盘常用一个循环播放的菜单背景视频列表（例如 301 段里只有 2 个
+    不同片段），其累计时长会超过正片。自动选片时应排除这类列表。"""
+    items = pl["items"]
+    if len(items) < 16:
+        return False
+    return len(set(items)) * 10 <= len(items)
 
 
 def print_playlist_table(pls, chosen=None):
@@ -1373,7 +1388,7 @@ def print_playlist_table(pls, chosen=None):
     for i, (name, pl) in enumerate(pls[:20]):
         cur = " ←" if chosen is not None and name == chosen else ""
         print("  [%d] %s  %s  %2d 段  %3d 章%s" % (
-            i, name, hms(pl["duration90"] / TS90), len(pl["items"]),
+            i, name, hms(pl["duration45"] / TS45), len(pl["items"]),
             sum(1 for m in pl["marks"] if m[0] == 1), cur))
     if len(pls) > 20:
         print("  … 共 %d 个（--playlist 序号或编号可选择）" % len(pls))
@@ -1479,7 +1494,14 @@ def setup_streams(args, remote):
             log("找不到播放列表：%s" % args.playlist)
             raise SystemExit(1)
     else:
-        pick_name = pls[0][0]
+        candidates = [(n, p) for n, p in pls if not is_looped_playlist(p)]
+        if candidates:
+            pick_name = candidates[0][0]
+            skipped = len(pls) - len(candidates)
+            if skipped:
+                log("已排除 %d 个循环/菜单类播放列表（同一片段反复播放）" % skipped)
+        else:
+            pick_name = pls[0][0]
     pl_map = dict(pls)
     print_playlist_table(pls, chosen=pick_name)
     if args.list:
@@ -1487,7 +1509,7 @@ def setup_streams(args, remote):
     pl = pl_map[pick_name]
     log("")
     log("选定正片：%s.mpls，时长 %s，%d 段 PlayItem，%d 个章节标记" % (
-        pick_name, hms(pl["duration90"] / TS90), len(pl["items"]),
+        pick_name, hms(pl["duration45"] / TS45), len(pl["items"]),
         sum(1 for m in pl["marks"] if m[0] == 1)))
     t2 = time.time()
     log("正在按 EP map 裁剪拼接虚拟流…")
@@ -1498,7 +1520,7 @@ def setup_streams(args, remote):
     StreamProxy.streams = {pick_name: vs}
     StreamProxy.main = pick_name
     StreamProxy.catalog = [
-        (name, p["duration90"] / TS90,
+        (name, p["duration45"] / TS45,
          sum(1 for m in p["marks"] if m[0] == 1), len(p["items"]))
         for name, p in pls]
     StreamProxy.builder = lambda name: (
@@ -1638,7 +1660,7 @@ def _mk_clpi(num_packets, eps):
 
 
 def _mk_mpls(items, marks):
-    """构造合成 MPLS。items = [(clip_id, in90, out90, stc)]，marks = [(type, ref, ts90)]。"""
+    """构造合成 MPLS。items = [(clip_id, in45, out45, stc)]，marks = [(type, ref, ts45)]。"""
     item_size = 2 + 20
     list_pos = 40
     pl_len = 6 + item_size * len(items)
@@ -1916,9 +1938,13 @@ def run_selftest():
     mpls = _mk_mpls(items, marks)
     pl = parse_mpls(mpls)
     assert pl["items"] == items, pl["items"]
-    assert pl["duration90"] == 811120 + 2700000
+    assert pl["duration45"] == 811120 + 2700000
     assert pl["marks"] == marks
-    print("MPLS 解析 ✔（2 PlayItem / 90 秒 / 3 标记）")
+    # 菜单循环列表识别（同一片段反复出现）
+    assert is_looped_playlist({"items": [("00001", 0, 45000, 0)] * 300})
+    assert not is_looped_playlist(
+        {"items": [("0000%d" % i, 0, 45000, 0) for i in range(30)]})
+    print("MPLS 解析 ✔（2 PlayItem / 3 标记 / 循环列表识别）")
 
     # ---- CLPI + EP map 查找 ----
     eps = [(45056, 100), (450560, 1000), (900608, 2000)]
@@ -1955,10 +1981,10 @@ def run_selftest():
 
     # 期望：item0 经 EP 裁剪为 [0, 2000*PKT)，item2 无 EP map 整段保留
     eps = [(45056, 100), (450560, 1000), (900608, 2000)]
-    mpls2 = _mk_mpls([("00001", 90000, 901120, 0), ("00002", 0, 2700000, 0)],
+    mpls2 = _mk_mpls([("00001", 45000, 900600, 0), ("00002", 0, 2700000, 0)],
                      [(1, 0, 540000), (1, 1, 900000), (2, 0, 0)])
     expected = clip1[:2000 * PKT] + clip2
-    ch_expected = [5.0, round(1711120 / TS90, 3)]
+    ch_expected = [11.0, round(1755600 / TS45, 3)]
 
     for with_meta in (False, True):
         iso, _ps = _mk_iso(mpls2, _mk_clpi(5000, eps), _mk_clpi(2700, []),
@@ -1967,7 +1993,7 @@ def run_selftest():
         pls = list_playlists(cf, pmap, _ps, part_len, tree)
         assert pls and pls[0][0] == "00001"
         pl = pls[0][1]
-        assert pl["items"][0][0] == "00001" and pl["duration90"] == 811120 + 2700000
+        assert pl["items"][0][0] == "00001" and pl["duration45"] == 3555600
         vs = build_vstream("00001", pl, clips)
         assert vs.total == len(expected), (vs.total, len(expected))
         ch = vs.meta["chapters"]
@@ -1982,7 +2008,7 @@ def run_selftest():
     StreamProxy.remote = remote
     StreamProxy.builder = None
     StreamProxy.ready = True
-    StreamProxy.catalog = [("00001", pl["duration90"] / TS90, 2, 2)]
+    StreamProxy.catalog = [("00001", pl["duration45"] / TS45, 2, 2)]
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), StreamProxy)
     port = httpd.server_address[1]
     th = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -1996,7 +2022,7 @@ def run_selftest():
         assert got == expected[383900:384101], "跨段 Range 数据不一致"
         with urllib.request.urlopen(base + "/movie.json", timeout=10) as r:
             meta = json.loads(r.read())
-        assert meta["chapters"][0]["t"] == 5.0
+        assert meta["chapters"][0]["t"] == 11.0
         print("HTTP 服务 ✔（Range 跨段拼接与章节元数据均正确）")
     finally:
         httpd.shutdown()
